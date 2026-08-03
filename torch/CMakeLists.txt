@@ -516,6 +516,50 @@ if(BUILD_PYTHON AND NOT BUILD_LIBTORCH_WHL)
     endif()
     install(TARGETS _nccl_ep RUNTIME DESTINATION "." LIBRARY DESTINATION ".")
   endif()
+
+  # ---[ Rust extension (torch._rust)
+  # Built by cargo, not CMake's compiler, so it can't go through
+  # Python_add_library like _C / _nccl_ep above. Runs at install time so the cxx
+  # C++ shim (tensor_ffi) compiles against the aggregated torch headers under the
+  # install prefix (TORCH_RUST_INCLUDE_DIR). Linking uses the build-tree lib dir
+  # (TORCH_RUST_LIB_DIR = build/lib), which already holds libtorch_python /
+  # libtorch -- the install prefix may not have them all staged yet when this
+  # rule runs. build.rs bakes the $ORIGIN/lib rpath so the module resolves
+  # torch/lib/ at import. The Buck build wires _rust differently (link_whole'd
+  # into _C.so), so this is the OSS-only path. torch/__init__.py requires
+  # torch._rust to exist, so a missing toolchain is fatal.
+  find_program(CARGO_EXECUTABLE NAMES cargo HINTS "$ENV{HOME}/.cargo/bin" "/opt/rust/bin")
+  if(NOT CARGO_EXECUTABLE)
+    message(FATAL_ERROR
+      "cargo is required to build the torch._rust extension but was not found. "
+      "Install Rust (https://rustup.rs) or put cargo on PATH / set the CARGO env var.")
+  endif()
+  if(APPLE)
+    set(_torch_rust_cdylib "lib_rust.dylib")
+  else()
+    set(_torch_rust_cdylib "lib_rust.so")
+  endif()
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+    OUTPUT_VARIABLE _torch_rust_ext_suffix
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    COMMAND_ERROR_IS_FATAL ANY)
+  install(CODE "
+    message(STATUS \"Building Rust extension torch._rust\")
+    execute_process(
+      COMMAND \"${CMAKE_COMMAND}\" -E env
+              \"PYO3_PYTHON=${Python_EXECUTABLE}\"
+              \"TORCH_RUST_INCLUDE_DIR=\${CMAKE_INSTALL_PREFIX}/include\"
+              \"TORCH_RUST_LIB_DIR=${CMAKE_BINARY_DIR}/lib\"
+              \"${CARGO_EXECUTABLE}\" build --profile=release
+              --manifest-path \"${TORCH_SRC_DIR}/_rust/Cargo.toml\"
+              --target-dir \"${CMAKE_BINARY_DIR}/rust\"
+      COMMAND_ERROR_IS_FATAL ANY)
+    file(COPY_FILE
+      \"${CMAKE_BINARY_DIR}/rust/release/${_torch_rust_cdylib}\"
+      \"\${CMAKE_INSTALL_PREFIX}/_rust${_torch_rust_ext_suffix}\")
+  ")
 endif()
 
 # Generate torch/version.py from the appropriate CMake cache variables.
