@@ -10,6 +10,13 @@ from torch.testing._internal.common_device_type import (
     dtypesIfCUDA,
     instantiate_device_type_tests,
 )
+from torch.testing._internal.common_quantized import (
+    _f32_to_floatx_unpacked,
+    _floatx_unpacked_to_f32,
+    FP4_EBITS,
+    FP4_MBITS,
+    pack_uint4,
+)
 from torch.testing._internal.common_utils import (
     DeterministicGuard,
     IS_WINDOWS,
@@ -427,6 +434,170 @@ class TestFloat4Dtype(TestCase):
 
         # can call contiguous on a dim1 slice (calls `copy_` under the hood)
         x1[:, 0:2048].contiguous()
+
+    @parametrize("input_dtype", [torch.float, torch.float16, torch.bfloat16])
+    def test_float4_e2m1fn_x2_cast(self, device, input_dtype):
+        # exact representable values, sign, saturation and rounding cases
+        x = torch.tensor(
+            [
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                [-0.5, -6.0, 0.3, 100.0, -100.0, 5.0, 2.7, 1.1],
+            ],
+            device=device,
+            dtype=input_dtype,
+        )
+
+        out = x.to(torch.float4_e2m1fn_x2)
+
+        # the cast packs two fp4 values per byte, halving the last dim
+        self.assertEqual(out.dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(out.shape, (2, 4))
+
+        # byte-exact match against the reference encode + pack
+        ref = pack_uint4(_f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS))
+        self.assertEqual(out.view(torch.uint8), ref, atol=0, rtol=0)
+
+    def test_float4_e2m1fn_x2_cast_inf_nan(self, device):
+        # fp4 has no inf/NaN encoding; per the OCP MX spec inf/overflow saturate
+        # to the max magnitude (sign preserved) and NaN (implementation-defined)
+        # is clamped the same way, so every NaN payload maps deterministically.
+        inf = float("inf")
+        nan = float("nan")
+        x = torch.tensor(
+            [[inf, -inf, nan, -nan, 1e30, -1e30, 6.0, -6.0]],
+            device=device,
+        )
+        out = x.to(torch.float4_e2m1fn_x2).to(torch.float32)
+        expected = torch.tensor(
+            [[6.0, -6.0, 6.0, -6.0, 6.0, -6.0, 6.0, -6.0]],
+            device=device,
+        )
+        self.assertEqual(out, expected, atol=0, rtol=0)
+
+        # NaN with an arbitrary payload must also saturate, not slip through
+        payloaded = torch.tensor([0x7FABCDEF], dtype=torch.int32, device=device).view(
+            torch.float32
+        )
+        x2 = torch.cat([payloaded, payloaded]).reshape(1, 2)
+        out2 = x2.to(torch.float4_e2m1fn_x2).to(torch.float32)
+        self.assertEqual(out2, torch.full((1, 2), 6.0, device=device), atol=0, rtol=0)
+
+    def test_float4_e2m1fn_x2_cast_non_differentiable(self, device):
+        x = torch.randn(2, 4, device=device, requires_grad=True)
+        out = x.to(torch.float4_e2m1fn_x2)
+        # the cast is a lossy, element-count changing quantization: non-diff
+        self.assertFalse(out.requires_grad)
+
+    def test_float4_e2m1fn_x2_cast_odd_last_dim(self, device):
+        x = torch.randn(2, 3, device=device)
+        with self.assertRaisesRegex(RuntimeError, "last dimension to be even"):
+            x.to(torch.float4_e2m1fn_x2)
+
+    @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on Windows yet")
+    def test_float4_e2m1fn_x2_cast_compile(self, device):
+        def fn(x):
+            return x.to(torch.float4_e2m1fn_x2)
+
+        x = torch.randn(2, 8, device=device)
+        ref = fn(x)
+        out = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+        self.assertEqual(out.dtype, torch.float4_e2m1fn_x2)
+        self.assertEqual(out.view(torch.uint8), ref.view(torch.uint8), atol=0, rtol=0)
+
+    @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on Windows yet")
+    def test_float4_e2m1fn_x2_cast_dynamic_shape(self, device):
+        # The packed cast halves the last dim, so the meta kernel must stay
+        # symbolic: a dynamic last dim must not be specialized to a constant.
+        from torch._dynamo.utils import counters
+
+        def fn(x):
+            return x.to(torch.float4_e2m1fn_x2)
+
+        torch._dynamo.reset()
+        counters.clear()
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=True)
+        for n in (8, 16, 32):
+            x = torch.randn(2, n, device=device)
+            torch._dynamo.mark_dynamic(x, 1)
+            out = compiled(x)
+            self.assertEqual(
+                out.view(torch.uint8), fn(x).view(torch.uint8), atol=0, rtol=0
+            )
+        # a single graph should cover every size if the last dim stays symbolic
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
+
+    def test_float4_e2m1fn_x2_cast_from(self, device):
+        # decode all 16 codes (8 magnitudes x sign), two per byte, and match the
+        # reference dequant applied to the same unpacked nibbles
+        codes = torch.arange(16, dtype=torch.uint8, device=device).reshape(1, 16)
+        packed = pack_uint4(codes).view(torch.float4_e2m1fn_x2)
+        out = packed.to(torch.float32)
+
+        # unpacking doubles the last dim (two fp4 values per byte)
+        self.assertEqual(out.shape, (1, 16))
+        ref = _floatx_unpacked_to_f32(codes, FP4_EBITS, FP4_MBITS)
+        self.assertEqual(out, ref, atol=0, rtol=0)
+
+    def test_float4_e2m1fn_x2_roundtrip_exact(self, device):
+        # values already on the fp4 grid round-trip bit-exactly
+        grid = torch.tensor(
+            [
+                [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                [-0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, -0.0],
+            ],
+            device=device,
+        )
+        back = grid.to(torch.float4_e2m1fn_x2).to(torch.float32)
+        self.assertEqual(back, grid, atol=0, rtol=0)
+
+    @parametrize(
+        "target_dtype",
+        [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2],
+    )
+    def test_float4_e2m1fn_x2_cast_from_targets(self, device, target_dtype):
+        # unpack composes with the normal cast for non-fp32 targets
+        f4 = torch.tensor([[0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]], device=device).to(
+            torch.float4_e2m1fn_x2
+        )
+        out = f4.to(target_dtype)
+        self.assertEqual(out.dtype, target_dtype)
+        self.assertEqual(out, f4.to(torch.float32).to(target_dtype), atol=0, rtol=0)
+
+    def test_float4_e2m1fn_x2_cast_from_non_differentiable(self, device):
+        f4 = torch.randn(2, 4, device=device).to(torch.float4_e2m1fn_x2)
+        with torch.enable_grad():
+            out = f4.to(torch.float32)
+        self.assertFalse(out.requires_grad)
+
+    @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on Windows yet")
+    def test_float4_e2m1fn_x2_cast_from_compile(self, device):
+        def fn(x):
+            return x.to(torch.float32)
+
+        x = torch.randn(2, 8, device=device).to(torch.float4_e2m1fn_x2)
+        ref = fn(x)
+        out = torch.compile(fn, backend="inductor", fullgraph=True)(x)
+        self.assertEqual(out, ref, atol=0, rtol=0)
+
+    @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on Windows yet")
+    def test_float4_e2m1fn_x2_cast_from_dynamic_shape(self, device):
+        # the unpack doubles the last dim, so the meta kernel must stay symbolic:
+        # a dynamic last dim must not be specialized to a constant.
+        from torch._dynamo.utils import counters
+
+        def fn(x):
+            return x.to(torch.float32)
+
+        torch._dynamo.reset()
+        counters.clear()
+        compiled = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=True)
+        for n in (4, 8, 16):
+            x = torch.randn(2, 2 * n, device=device).to(torch.float4_e2m1fn_x2)
+            torch._dynamo.mark_dynamic(x, 1)
+            out = compiled(x)
+            self.assertEqual(out, fn(x), atol=0, rtol=0)
+        # a single graph should cover every size if the last dim stays symbolic
+        self.assertEqual(counters["stats"]["unique_graphs"], 1)
 
     def test_f4_save_load(self, device):
         x1 = torch.randint(0, 10, (4, 4), device=device, dtype=torch.uint8).view(
