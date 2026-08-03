@@ -22,7 +22,7 @@ from torch.testing import make_tensor
 from torch.testing._internal.common_utils import (
     IS_FBCODE, IS_JETSON, IS_MACOS, IS_SANDCASTLE, IS_WINDOWS, TestCase, run_tests, slowTest,
     parametrize, reparametrize, subtest, instantiate_parametrized_tests, dtype_name,
-    TEST_WITH_ROCM, decorateIf, skipIfXpu
+    TEST_WITH_PERIODIC, TEST_WITH_ROCM, decorateIf, periodic, skipIfXpu,
 )
 from torch.testing._internal.common_device_type import \
     (PYTORCH_TESTING_DEVICE_EXCEPT_FOR_KEY, PYTORCH_TESTING_DEVICE_ONLY_FOR_KEY, dtypes,
@@ -609,6 +609,150 @@ if __name__ == '__main__':
         env[PYTORCH_TESTING_DEVICE_ONLY_FOR_KEY] = 'cpu'
         _, stderr = TestCase.run_process_no_exception(test_filter_file_template, env=env)
         self.assertNotIn('OK', stderr.decode('ascii'))
+
+
+class TestPeriodicDecorator(TestCase):
+    _PERIODIC_TEST_PROGRAM = """\
+import torch.testing._internal.common_utils as common_utils
+from torch.testing._internal.common_device_type import instantiate_device_type_tests
+from torch.testing._internal.common_utils import (
+    TestCase,
+    parametrize,
+    periodic,
+    run_tests,
+    slowTest,
+)
+
+
+class TestPeriodicModes(TestCase):
+    def test_plain(self):
+        print("RUN:plain")
+
+    @periodic
+    @slowTest
+    def test_periodic_outside_slow(self):
+        print("RUN:periodic_outside_slow")
+
+    @slowTest
+    @periodic
+    def test_slow_outside_periodic(self):
+        print("RUN:slow_outside_periodic")
+
+    @slowTest
+    def test_slow_only(self):
+        print("RUN:slow_only")
+
+    @periodic
+    def test_automatic_periodic(self):
+        print("RUN:automatic_periodic")
+
+    def test_automatic_nonperiodic(self):
+        print("RUN:automatic_nonperiodic")
+
+
+class TestPeriodicDevice(TestCase):
+    @parametrize("value", [1, 2])
+    @periodic
+    def test_device(self, device, value):
+        print(f"RUN:device_{value}_{device}")
+
+    @periodic
+    @parametrize("value", [3])
+    def test_periodic_outside_parametrize(self, device, value):
+        print(f"RUN:device_outside_{value}_{device}")
+
+
+common_utils.slow_tests_dict = {
+    "test_automatic_periodic (__main__.TestPeriodicModes)": None,
+    "test_automatic_nonperiodic (__main__.TestPeriodicModes)": None,
+}
+instantiate_device_type_tests(TestPeriodicDevice, globals(), only_for="cpu")
+for test_name in dir(TestPeriodicDeviceCPU):
+    if test_name.startswith("test_"):
+        common_utils.slow_tests_dict[
+            f"{test_name} (__main__.TestPeriodicDeviceCPU)"
+        ] = None
+
+if __name__ == "__main__":
+    run_tests()
+"""
+
+    def _run_periodic_test_program(self, *, periodic_enabled=False, slow_enabled=False):
+        env = os.environ.copy()
+        for key in (
+            "CI",
+            "DISABLED_TESTS_FILE",
+            "PYTORCH_TEST_SKIP_FAST",
+            "PYTORCH_TEST_WITH_PERIODIC",
+            "PYTORCH_TEST_WITH_SLOW",
+            "SLOW_TESTS_FILE",
+            "TEST_SHOWLOCALS",
+        ):
+            env.pop(key, None)
+        if periodic_enabled:
+            env["PYTORCH_TEST_WITH_PERIODIC"] = "1"
+        if slow_enabled:
+            env["PYTORCH_TEST_WITH_SLOW"] = "1"
+
+        result = subprocess.run(
+            [sys.executable, "-c", self._PERIODIC_TEST_PROGRAM],
+            capture_output=True,
+            cwd=os.path.dirname(os.path.realpath(__file__)),
+            env=env,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"Subprocess failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        return {
+            line.removeprefix("RUN:")
+            for line in result.stdout.splitlines()
+            if line.startswith("RUN:")
+        }
+
+    @parametrize(
+        "periodic_enabled, slow_enabled, expected",
+        [
+            subtest((False, False, {"plain"}), name="default"),
+            subtest(
+                (
+                    True,
+                    False,
+                    {
+                        "automatic_periodic",
+                        "device_1_cpu",
+                        "device_2_cpu",
+                        "device_outside_3_cpu",
+                        "periodic_outside_slow",
+                        "plain",
+                        "slow_outside_periodic",
+                    },
+                ),
+                name="periodic",
+            ),
+            subtest(
+                (False, True, {"automatic_nonperiodic", "plain", "slow_only"}),
+                name="slow",
+            ),
+        ],
+    )
+    def test_periodic_modes(self, periodic_enabled, slow_enabled, expected):
+        self.assertEqual(
+            self._run_periodic_test_program(
+                periodic_enabled=periodic_enabled,
+                slow_enabled=slow_enabled,
+            ),
+            expected,
+        )
+
+    @periodic
+    def test_periodic_smoke(self):
+        self.assertTrue(TEST_WITH_PERIODIC)
+
+
+instantiate_parametrized_tests(TestPeriodicDecorator)
 
 
 class TestEnvironmentDefFlag(TestCase):
